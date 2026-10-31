@@ -1,39 +1,53 @@
+#define _POSIX_C_SOURCE 200809L
 #include <errno.h>
-#include <inttypes.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
-enum { HOURS = 72, MAX_ENDPOINTS = 1842, HASH_SLOTS = 4096, BUFFER_SIZE = 1 << 20 };
+#ifndef WORKERS
+#define WORKERS 12
+#endif
+enum { HOURS = 72, MAX_ENDPOINTS = 1842, HASH_SLOTS = 4096 };
 
+typedef struct { const char *begin, *end; } Run;
 typedef struct {
-    uint32_t *values;
-    uint32_t count, capacity, errors;
+    Run *runs;
+    size_t count, capacity, records, length;
+    char stamp[21], *output;
+} Hour;
+typedef struct {
+    const char *name;
+    uint32_t length, count, errors, begin, next;
 } Group;
+typedef struct { uint32_t slot, latency; } Record;
 
-typedef struct {
-    char name[126];
-    size_t length;
-    Group groups[HOURS];
-} Endpoint;
-
-static Endpoint endpoints[MAX_ENDPOINTS];
-static Endpoint *table[HASH_SLOTS], *ordered[MAX_ENDPOINTS];
-static size_t endpoint_count;
-static char hours[HOURS][21], buffer[BUFFER_SIZE];
+static const char *input;
+static size_t input_size;
+static Hour hours[HOURS];
+static pthread_mutex_t index_lock = PTHREAD_MUTEX_INITIALIZER;
+static atomic_uint next_hour;
 
 static void fail(const char *message) {
     fprintf(stderr, "ingest: %s\n", message);
     exit(EXIT_FAILURE);
 }
 
+static void *resize(void *memory, size_t bytes) {
+    void *result = realloc(memory, bytes);
+    if (!result)
+        fail("out of memory");
+    return result;
+}
+
 static FILE *open_file(const char *directory, const char *name, const char *mode) {
     size_t size = strlen(directory) + strlen(name) + 2;
-    char *path = malloc(size);
-    if (!path)
-        fail("out of memory");
+    char *path = resize(NULL, size);
     snprintf(path, size, "%s/%s", directory, name);
     FILE *file = fopen(path, mode);
     if (!file) {
@@ -44,149 +58,209 @@ static FILE *open_file(const char *directory, const char *name, const char *mode
     return file;
 }
 
-static Endpoint *find_endpoint(const char *name, size_t length, uint32_t hash) {
-    size_t slot = hash & (HASH_SLOTS - 1);
-    while (table[slot]) {
-        Endpoint *endpoint = table[slot];
-        if (endpoint->length == length && !memcmp(endpoint->name, name, length))
-            return endpoint;
-        slot = (slot + 1) & (HASH_SLOTS - 1);
-    }
-    if (endpoint_count == MAX_ENDPOINTS)
-        fail("too many endpoints (specification limit is 1842)");
-    Endpoint *endpoint = &endpoints[endpoint_count];
-    ordered[endpoint_count++] = table[slot] = endpoint;
-    memcpy(endpoint->name, name, length);
-    endpoint->length = length;
-    return endpoint;
-}
-
-/* The grammar guarantees complete, well-formed LF-terminated records here. */
-static const char *parse_line(const char *line) {
+static unsigned hour_id(const char *line) {
     unsigned day = (unsigned)(line[8] - '0') * 10 + (unsigned)(line[9] - '0');
-    /* The specified 72-hour span crosses October 31 into November 1. */
     unsigned days = line[6] == '0' ? day - 30 : day + 1;
-    unsigned hour = days * 24 + (unsigned)(line[11] - '0') * 10 +
-                    (unsigned)(line[12] - '0') - 18;
-    if (!hours[hour][0]) {
-        memcpy(hours[hour], line, 13);
-        memcpy(hours[hour] + 13, ":00:00Z", 8);
-    }
-    const char *p = line + 28; /* Skip the fixed-width timestamp and space. */
-    while (*p++ != ' ')       /* Ignore the method. */
-        ;
-    const char *name = p;
-    uint32_t hash = UINT32_C(2166136261);
-    while (*p != ' ') {
-        hash = (hash ^ (unsigned char)*p) * UINT32_C(16777619);
-        ++p;
-    }
-    Endpoint *endpoint = find_endpoint(name, (size_t)(p - name), hash);
-    Group *group = &endpoint->groups[hour];
-    group->errors += p[1] == '5';
-    p += 5; /* Space, three status digits, space. */
-    uint32_t latency = 0;
-    while (*p != '\n')
-        latency = latency * 10 + (unsigned)(*p++ - '0');
-    if (group->count == group->capacity) {
-        uint32_t capacity = group->capacity ? group->capacity * 2 : 4;
-        uint32_t *values = realloc(group->values, (size_t)capacity * sizeof(*values));
-        if (!values)
-            fail("out of memory");
-        group->values = values;
-        group->capacity = capacity;
-    }
-    group->values[group->count++] = latency;
-    return p + 1;
+    return days * 24 + (unsigned)(line[11] - '0') * 10 + (unsigned)(line[12] - '0') - 18;
 }
 
-static void ingest(FILE *input) {
-    size_t carry = 0;
-    while (!feof(input)) {
-        size_t bytes = fread(buffer + carry, 1, sizeof(buffer) - carry, input);
-        if (ferror(input))
-            fail("could not read requests.log");
-        const char *end = buffer + carry + bytes, *stop = end;
-        while (stop > buffer && stop[-1] != '\n')
-            --stop;
-        const char *p = buffer;
-        while (p < stop)
-            p = parse_line(p);
-        carry = (size_t)(end - stop);
-        if (carry == sizeof(buffer))
-            fail("input record exceeds the buffer size");
-        memmove(buffer, stop, carry);
-    }
-    if (carry)
-        fail("requests.log must end with a newline");
+static const char *boundary(size_t offset) {
+    if (!offset || offset == input_size)
+        return input + offset;
+    return (const char *)memchr(input + offset - 1, '\n', input_size - offset + 1) + 1;
 }
 
-static void swap(uint32_t *a, uint32_t *b) {
-    uint32_t value = *a;
-    *a = *b;
-    *b = value;
-}
-
-/* Three-way quickselect keeps equal values together, including all-equal groups. */
-static uint32_t select_rank(uint32_t *values, size_t count, size_t rank) {
-    size_t lo = 0, hi = count;
-    while (hi - lo > 1) {
-        uint32_t a = values[lo], b = values[lo + (hi - lo) / 2], c = values[hi - 1];
-        if (a > b)
-            swap(&a, &b);
-        if (b > c)
-            swap(&b, &c);
-        if (a > b)
-            swap(&a, &b);
-        uint32_t pivot = b;
-        size_t less = lo, scan = lo, greater = hi;
-        while (scan < greater) {
-            if (values[scan] < pivot)
-                swap(&values[less++], &values[scan++]);
-            else if (values[scan] > pivot)
-                swap(&values[scan], &values[--greater]);
-            else
-                ++scan;
+/* Index actual equal-hour runs; no assumption about timestamp order or shard lag. */
+static void *index_input(void *argument) {
+    size_t worker = (uintptr_t)argument;
+    const char *p = boundary(input_size * worker / WORKERS);
+    const char *end = boundary(input_size * (worker + 1) / WORKERS);
+    while (p < end) {
+        const char *begin = p;
+        unsigned id = hour_id(p);
+        size_t records = 0;
+        do {
+            ++records;
+            p = (const char *)memchr(p + 32, '\n', (size_t)(end - p - 32)) + 1;
+        } while (p < end && hour_id(p) == id);
+        pthread_mutex_lock(&index_lock);
+        Hour *hour = &hours[id];
+        if (hour->count == hour->capacity) {
+            hour->capacity = hour->capacity ? hour->capacity * 2 : 16;
+            hour->runs = resize(hour->runs, hour->capacity * sizeof(*hour->runs));
         }
-        if (rank < less)
-            hi = less;
-        else if (rank >= greater)
-            lo = greater;
-        else
-            return pivot;
+        hour->runs[hour->count++] = (Run){begin, p};
+        hour->records += records;
+        memcpy(hour->stamp, begin, 13);
+        memcpy(hour->stamp + 13, ":00:00Z", 8);
+        pthread_mutex_unlock(&index_lock);
     }
-    return values[lo];
+    return NULL;
 }
 
-static int compare_endpoints(const void *a, const void *b) {
-    const Endpoint *left = *(Endpoint *const *)a;
-    const Endpoint *right = *(Endpoint *const *)b;
-    return strcmp(left->name, right->name);
+/* Mix a few words, then check the full path on every match. Collisions are harmless. */
+static uint64_t endpoint_hash(const char *name, size_t length) {
+    uint64_t a = 0, b = 0, c = 0;
+    if (length >= 8) {
+        memcpy(&a, name, 8);
+        memcpy(&b, name + (length - 8) / 2, 8);
+        memcpy(&c, name + length - 8, 8);
+    } else {
+        memcpy(&a, name, length);
+    }
+    uint64_t hash = (a ^ b * UINT64_C(0x9e3779b185ebca87) ^ c) + length;
+    hash ^= hash >> 29;
+    hash *= UINT64_C(0xbf58476d1ce4e5b9);
+    return hash ^ (hash >> 32);
 }
 
-static void write_summary(FILE *output) {
-    const unsigned percentiles[] = {50, 95, 99};
-    qsort(ordered, endpoint_count, sizeof(*ordered), compare_endpoints);
-    for (unsigned hour = 0; hour < HOURS; ++hour) {
-        for (size_t e = 0; e < endpoint_count; ++e) {
-            Group *group = &ordered[e]->groups[hour];
-            if (!group->count)
-                continue;
-            uint32_t result[3];
-            size_t base = 0;
-            for (size_t i = 0; i < 3; ++i) {
-                size_t rank = ((uint64_t)percentiles[i] * group->count + 99) / 100 - 1;
-                result[i] = select_rank(group->values + base, group->count - base, rank - base);
-                base = rank; /* Higher percentiles only need the remaining upper partition. */
+static int compare_groups(const void *a, const void *b) {
+    const Group *left = *(Group *const *)a, *right = *(Group *const *)b;
+    size_t length = left->length < right->length ? left->length : right->length;
+    int order = memcmp(left->name, right->name, length);
+    return order ? order : (left->length > right->length) - (left->length < right->length);
+}
+
+static uint32_t select_rank(uint32_t *values, int count, int rank) {
+    int lo = 0, hi = count - 1;
+    while (hi - lo > 12) {
+        uint32_t pivot = values[lo + (hi - lo) / 2];
+        int i = lo, j = hi;
+        do {
+            while (values[i] < pivot)
+                ++i;
+            while (values[j] > pivot)
+                --j;
+            if (i <= j) {
+                uint32_t value = values[i];
+                values[i++] = values[j];
+                values[j--] = value;
             }
-            uint64_t ppm = (uint64_t)group->errors * 1000000 / group->count;
-            if (fprintf(output, "%s %s %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32
-                                " %" PRIu32 " %" PRIu64 "\n",
-                        hours[hour], ordered[e]->name, group->count, result[0], result[1],
-                        result[2], group->errors, ppm) < 0)
-                fail("could not write summary.txt");
+        } while (i <= j);
+        if (rank <= j)
+            hi = j;
+        else if (rank >= i)
+            lo = i;
+        else
+            return values[rank];
+    }
+    for (int i = lo + 1; i <= hi; ++i) {
+        uint32_t value = values[i];
+        int j = i;
+        while (j > lo && values[j - 1] > value) {
+            values[j] = values[j - 1];
+            --j;
+        }
+        values[j] = value;
+    }
+    return values[rank];
+}
+
+static char *put_uint(char *out, uint32_t value) {
+    char digits[10];
+    unsigned count = 0;
+    do {
+        digits[count++] = (char)('0' + value % 10);
+        value /= 10;
+    } while (value);
+    while (count)
+        *out++ = digits[--count];
+    return out;
+}
+
+static void process_hour(Hour *hour) {
+    Group groups[HASH_SLOTS] = {0}, *ordered[MAX_ENDPOINTS];
+    unsigned group_count = 0;
+    Record *records = resize(NULL, hour->records * sizeof(*records));
+    uint32_t *values = resize(NULL, hour->records * sizeof(*values));
+    size_t record = 0;
+    for (size_t r = 0; r < hour->count; ++r) {
+        const char *p = hour->runs[r].begin, *end = hour->runs[r].end;
+        while (p < end) {
+            p += 28;
+            while (*p++ != ' ')
+                ;
+            const char *name = p;
+            p = memchr(name, ' ', (size_t)(end - name));
+            size_t length = (size_t)(p - name);
+            size_t slot = endpoint_hash(name, length) & (HASH_SLOTS - 1);
+            while (groups[slot].name && (groups[slot].length != length ||
+                   memcmp(groups[slot].name, name, length)))
+                slot = (slot + 1) & (HASH_SLOTS - 1);
+            Group *group = &groups[slot];
+            if (!group->name) {
+                if (group_count == MAX_ENDPOINTS)
+                    fail("too many endpoints (specification limit is 1842)");
+                group->name = name;
+                group->length = (uint32_t)length;
+                ordered[group_count++] = group;
+            }
+            ++group->count;
+            group->errors += p[1] == '5';
+            p += 5;
+            uint32_t latency = 0;
+            while (*p != '\n')
+                latency = latency * 10 + (unsigned)(*p++ - '0');
+            ++p;
+            records[record++] = (Record){(uint32_t)slot, latency};
         }
     }
+    uint32_t offset = 0;
+    for (unsigned e = 0; e < group_count; ++e) {
+        Group *group = ordered[e];
+        group->begin = group->next = offset;
+        offset += group->count;
+    }
+    for (size_t i = 0; i < record; ++i)
+        values[groups[records[i].slot].next++] = records[i].latency;
+    free(records);
+    qsort(ordered, group_count, sizeof(*ordered), compare_groups);
+    char *out = hour->output = resize(NULL, (size_t)group_count * 224);
+    const unsigned percentiles[] = {50, 95, 99};
+    for (unsigned e = 0; e < group_count; ++e) {
+        Group *group = ordered[e];
+        uint32_t numbers[6] = {group->count, 0, 0, 0, group->errors,
+                              (uint32_t)((uint64_t)group->errors * 1000000 / group->count)};
+        int base = 0;
+        for (unsigned i = 0; i < 3; ++i) {
+            int rank = (int)(((uint64_t)percentiles[i] * group->count + 99) / 100 - 1);
+            numbers[i + 1] = i && rank == base ? numbers[i] :
+                select_rank(values + group->begin + base, (int)group->count - base, rank - base);
+            base = rank;
+        }
+        memcpy(out, hour->stamp, 20);
+        out += 20;
+        *out++ = ' ';
+        memcpy(out, group->name, group->length);
+        out += group->length;
+        for (unsigned i = 0; i < 6; ++i) {
+            *out++ = ' ';
+            out = put_uint(out, numbers[i]);
+        }
+        *out++ = '\n';
+    }
+    hour->length = (size_t)(out - hour->output);
+    free(values);
+}
+
+static void *summarize(void *unused) {
+    (void)unused;
+    unsigned id;
+    while ((id = atomic_fetch_add_explicit(&next_hour, 1, memory_order_relaxed)) < HOURS)
+        if (hours[id].records)
+            process_hour(&hours[id]);
+    return NULL;
+}
+
+static void parallel(void *(*function)(void *)) {
+    pthread_t workers[WORKERS - 1];
+    for (uintptr_t i = 0; i < WORKERS - 1; ++i)
+        if (pthread_create(&workers[i], NULL, function, (void *)i))
+            fail("could not start worker thread");
+    function((void *)(uintptr_t)(WORKERS - 1));
+    for (unsigned i = 0; i < WORKERS - 1; ++i)
+        if (pthread_join(workers[i], NULL))
+            fail("could not join worker thread");
 }
 
 int main(int argc, char **argv) {
@@ -196,28 +270,41 @@ int main(int argc, char **argv) {
             puts("Usage: ingest [--data DIRECTORY] [--out DIRECTORY]");
             return EXIT_SUCCESS;
         }
-        if (i + 1 < argc && !strcmp(argv[i], "--data")) {
+        if (i + 1 < argc && !strcmp(argv[i], "--data"))
             data_dir = argv[++i];
-        } else if (i + 1 < argc && !strcmp(argv[i], "--out")) {
+        else if (i + 1 < argc && !strcmp(argv[i], "--out"))
             out_dir = argv[++i];
-        } else {
+        else
             fail("expected --data DIRECTORY or --out DIRECTORY (see --help)");
-        }
     }
-    FILE *input = open_file(data_dir, "requests.log", "rb");
-    ingest(input);
-    if (fclose(input))
-        fail("could not close requests.log");
+    FILE *source = open_file(data_dir, "requests.log", "rb");
+    struct stat info;
+    if (fstat(fileno(source), &info) || !S_ISREG(info.st_mode))
+        fail("could not read requests.log as a regular file");
+    input_size = (size_t)info.st_size;
+    if (input_size) {
+        input = mmap(NULL, input_size, PROT_READ, MAP_PRIVATE, fileno(source), 0);
+        if (input == MAP_FAILED)
+            fail("could not map requests.log");
+        if (input[input_size - 1] != '\n')
+            fail("requests.log must end with a newline");
+        parallel(index_input);
+        parallel(summarize);
+    }
     if (mkdir(out_dir, 0777) && errno != EEXIST)
         fail("could not create the output directory");
     FILE *output = open_file(out_dir, "summary.txt", "wb");
-    if (setvbuf(output, NULL, _IOFBF, BUFFER_SIZE))
-        fail("could not buffer summary.txt");
-    write_summary(output);
+    for (unsigned h = 0; h < HOURS; ++h) {
+        if (hours[h].length && fwrite(hours[h].output, 1, hours[h].length, output) != hours[h].length)
+            fail("could not write summary.txt");
+        free(hours[h].output);
+        free(hours[h].runs);
+    }
     if (fclose(output))
         fail("could not finish writing summary.txt");
-    for (size_t e = 0; e < endpoint_count; ++e)
-        for (unsigned hour = 0; hour < HOURS; ++hour)
-            free(endpoints[e].groups[hour].values);
+    if (input_size && munmap((void *)input, input_size))
+        fail("could not unmap requests.log");
+    if (fclose(source))
+        fail("could not close requests.log");
     return EXIT_SUCCESS;
 }

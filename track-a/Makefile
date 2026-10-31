@@ -1,4 +1,4 @@
-CFLAGS ?= -O3 -std=c11 -Wall -Wextra -Wpedantic
+CFLAGS ?= -O3 -march=native -std=c11 -Wall -Wextra -Wpedantic -pthread
 
 solution: ingest.c
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<

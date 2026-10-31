@@ -52,7 +52,7 @@ class TrackATest(unittest.TestCase):
         cls.build = tempfile.TemporaryDirectory(prefix="track-a-build-")
         cls.addClassCleanup(cls.build.cleanup)
         cls.binary = Path(cls.build.name) / "solution"
-        flags = ["-std=c11", "-Wall", "-Wextra", "-Wpedantic", "-Werror"]
+        flags = ["-std=c11", "-Wall", "-Wextra", "-Wpedantic", "-Werror", "-pthread"]
         if os.environ.get("TRACK_A_SANITIZE") == "1":
             flags += ["-O1", "-g", "-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
         else:
