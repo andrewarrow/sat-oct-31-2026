@@ -146,6 +146,29 @@ class TrackATest(unittest.TestCase):
         names = [f"/endpoint/{i:04d}" for i in range(1842)]
         self.check_summary("".join(record(i % 72, name, 200, i) for i, name in enumerate(names)))
 
+    def test_sampled_hash_collisions_and_short_names(self):
+        # These paths differ outside all three sampled words in endpoint_hash.
+        names = ["/" + "a" * 19 + f"{i:04d}" + "a" * 101 for i in range(64)]
+        self.assertTrue(all(len(name) == 125 for name in names))
+        names += ["/" + "a" * length for length in range(15)]
+        rng = random.Random(19)
+        lines = [record(hour, name, 500, i, offset=i)
+                 for hour in (0, 30, 71) for i, name in enumerate(names)]
+        rng.shuffle(lines)
+        self.check_summary("".join(lines))
+
+    def test_every_latency_width_and_final_mapped_page(self):
+        values = [0, 4294967295] + [10 ** power + delta
+                  for power in range(10) for delta in (-1, 0, 1) if 10 ** power + delta >= 0]
+        for length in (1, 2, 7, 8, 9, 31, 124, 125):
+            with self.subTest(endpoint_length=length):
+                self.check_summary("".join(record(71, "/" + "x" * (length - 1), 599, value)
+                                           for value in values))
+
+    def test_many_unordered_hour_runs(self):
+        self.check_summary("".join(record((i * 31) % 72, f"/run/{i % 17}", 200, i)
+                                   for i in range(10_000)))
+
     def test_randomized_records_across_multiple_input_buffers(self):
         rng = random.Random(20261031)
         names = ["/", LONGEST, "/v2/orders", "/v2/orders.csv"] + [f"/random/{i}" for i in range(40)]

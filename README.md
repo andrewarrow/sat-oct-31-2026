@@ -1,7 +1,7 @@
 # Speed Demon 2026 starter
 
 
-A working entry for all four tracks of [Speed Demon 2026](https://speeddemon.dev). Each `track-*` folder holds the organisers' naive Python reference, packaged the way the live board builds and runs it. Use it to check your setup end to end, then replace the reference with your own code.
+A working entry for all four tracks of [Speed Demon 2026](https://speeddemon.dev). Track A uses a dependency-free parallel C implementation; see [its README](track-a/README.md) for native build and test commands. Tracks B–D hold the organisers' naive Python references, packaged the way the live board builds and runs them.
 
 ## Start in five steps
 

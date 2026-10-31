@@ -179,7 +179,7 @@ static void process_hour(Hour *hour) {
     for (size_t r = 0; r < hour->count; ++r) {
         const char *p = hour->runs[r].begin, *end = hour->runs[r].end;
         while (p < end) {
-            p += 28;
+            p += 31; /* Timestamp, space, and the minimum three method bytes. */
             while (*p++ != ' ')
                 ;
             const char *name = p;
@@ -266,7 +266,7 @@ static void *summarize(void *unused) {
 }
 
 static void parallel(void *(*function)(void *)) {
-    pthread_t workers[WORKERS - 1];
+    pthread_t workers[WORKERS];
     for (uintptr_t i = 0; i < WORKERS - 1; ++i)
         if (pthread_create(&workers[i], NULL, function, (void *)i))
             fail("could not start worker thread");
