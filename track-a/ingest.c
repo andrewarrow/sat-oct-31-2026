@@ -32,6 +32,8 @@ static size_t input_size;
 static Hour hours[HOURS];
 static pthread_mutex_t index_lock = PTHREAD_MUTEX_INITIALIZER;
 static atomic_uint next_hour;
+static FILE *output;
+static unsigned next_write;
 
 static void fail(const char *message) {
     fprintf(stderr, "ingest: %s\n", message);
@@ -215,7 +217,7 @@ static void process_hour(Hour *hour) {
         values[groups[records[i].slot].next++] = records[i].latency;
     free(records);
     qsort(ordered, group_count, sizeof(*ordered), compare_groups);
-    char *out = hour->output = resize(NULL, (size_t)group_count * 224);
+    char *begin = resize(NULL, (size_t)group_count * 224), *out = begin;
     const unsigned percentiles[] = {50, 95, 99};
     for (unsigned e = 0; e < group_count; ++e) {
         Group *group = ordered[e];
@@ -239,8 +241,19 @@ static void process_hour(Hour *hour) {
         }
         *out++ = '\n';
     }
-    hour->length = (size_t)(out - hour->output);
     free(values);
+    /* Publish complete hours and drain the ready prefix in chronological order. */
+    pthread_mutex_lock(&index_lock);
+    hour->output = begin;
+    hour->length = (size_t)(out - begin);
+    while (next_write < HOURS && (!hours[next_write].records || hours[next_write].output)) {
+        Hour *ready = &hours[next_write++];
+        if (ready->length && fwrite(ready->output, 1, ready->length, output) != ready->length)
+            fail("could not write summary.txt");
+        free(ready->output);
+        ready->output = NULL;
+    }
+    pthread_mutex_unlock(&index_lock);
 }
 
 static void *summarize(void *unused) {
@@ -289,17 +302,14 @@ int main(int argc, char **argv) {
         if (input[input_size - 1] != '\n')
             fail("requests.log must end with a newline");
         parallel(index_input);
-        parallel(summarize);
     }
     if (mkdir(out_dir, 0777) && errno != EEXIST)
         fail("could not create the output directory");
-    FILE *output = open_file(out_dir, "summary.txt", "wb");
-    for (unsigned h = 0; h < HOURS; ++h) {
-        if (hours[h].length && fwrite(hours[h].output, 1, hours[h].length, output) != hours[h].length)
-            fail("could not write summary.txt");
-        free(hours[h].output);
+    output = open_file(out_dir, "summary.txt", "wb");
+    if (input_size)
+        parallel(summarize);
+    for (unsigned h = 0; h < HOURS; ++h)
         free(hours[h].runs);
-    }
     if (fclose(output))
         fail("could not finish writing summary.txt");
     if (input_size && munmap((void *)input, input_size))
