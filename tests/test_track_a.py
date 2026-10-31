@@ -53,6 +53,8 @@ class TrackATest(unittest.TestCase):
         cls.addClassCleanup(cls.build.cleanup)
         cls.binary = Path(cls.build.name) / "solution"
         flags = ["-std=c11", "-Wall", "-Wextra", "-Wpedantic", "-Werror", "-pthread"]
+        if "TRACK_A_WORKERS" in os.environ:
+            flags += [f"-DWORKERS={int(os.environ['TRACK_A_WORKERS'])}"]
         if os.environ.get("TRACK_A_SANITIZE") == "1":
             flags += ["-O1", "-g", "-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
         else:

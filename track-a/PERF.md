@@ -47,6 +47,9 @@ used warmed inputs and trimmed means; results include native process startup.
 | Explicit SIMD newline search | About 2.4% faster | Reject: source growth and architecture branches for a small gain |
 | Bulk decimal parsing | About 2.1% faster | Reject: marginal gain after source cost |
 | One worker team with a barrier between phases | No repeatable improvement | Reject |
+| Single parsing pass with six-byte intermediate records | 19.0 ms vs 22.3 ms | Park: anonymous peak footprint increased from about 21 to 32 MB, risking a lower K |
+| Single parsing pass with per-shard latency vectors and bulk merges | 22.5 ms vs 22.3 ms | Reject: no speed gain and a larger footprint |
+| Copy endpoint names or cache sorting prefixes | 1–5% slower | Reject |
 
 Local `mmap` RSS includes the input and must not be substituted for scored M.
 The official harness uses cgroup memory accounting and prewarms the input outside
@@ -59,3 +62,11 @@ matching it needs about 28.6 ms on the scoring CPU. At 20 MB and S = 334 the tar
 is about 31.1 ms. The next substantial experiment is eliminating the separate
 indexing pass while keeping intermediate records compact. Unknown holdout seeds and
 arbitrary timestamp disorder remain correctness requirements.
+
+The surviving implementation remains the measured hour-index design, with a small
+method-skip improvement. Worker count is now a Makefile option so six/eight/twelve
+worker builds can be compared on the scoring machine. This is a more useful next
+official experiment than adopting a locally faster variant with a large memory cost.
+The current source is 337 normalized lines, including the selectable worker count
+and its compile-time bounds check; the official step-2 measurements above remain
+those of the 334-line commit.

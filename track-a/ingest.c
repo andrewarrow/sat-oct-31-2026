@@ -13,6 +13,7 @@
 #ifndef WORKERS
 #define WORKERS 12
 #endif
+_Static_assert(WORKERS >= 1 && WORKERS <= 12, "WORKERS must be between 1 and 12");
 enum { HOURS = 72, MAX_ENDPOINTS = 1842, HASH_SLOTS = 4096 };
 
 typedef struct { const char *begin, *end; } Run;

@@ -56,6 +56,14 @@ in alternating order. Local timings are for iteration; official K uses the scori
 machine. Local RSS includes the mapped input, whereas the harness excludes the
 host-prewarmed input from its cgroup memory accounting.
 
+Worker-count experiments use `make -B -C track-a WORKERS=6` (or `WORKERS=8`). The
+default is 12. The scoring allocation has six physical P-cores with SMT, so fewer
+workers may trade less contention and memory against available parallelism. Local
+scaling on a Mac with twelve physical P-cores cannot settle that choice. Validate a
+configuration with `TRACK_A_WORKERS=6 python3 -m unittest discover -s tests -v`.
+For a board comparison, change the `WORKERS ?= 12` default in the Makefile before
+the next submission; a local command-line override does not change the board build.
+
 ## Dependencies
 
 Zero external runtime dependencies (`dependency_count = 0`, so D = 1). C11 and POSIX
